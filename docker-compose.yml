@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./checkpoints:/app/checkpoints
+    stdin_open: true
+    tty: true
+    environment:
+      - PYTHONUNBUFFERED=1
