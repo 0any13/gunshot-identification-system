@@ -1,19 +1,10 @@
 """
 preprocess.py
 
-Reads raw audio files, computes mel spectrograms, and saves them as .npy files
-alongside a CSV manifest so the Dataset class can load them efficiently.
-
-Expected raw data layout:
-    data/raw/
-        gunshot/        <- .wav files
-        police_siren/
-        ambulance_siren/
-        firetruck_siren/
-        background/
+Computes mel spectrograms for both stages and saves manifests.
 
 Run:
-    python src/preprocess.py
+    docker compose run app python src/preprocess.py
 """
 
 import os
@@ -25,80 +16,87 @@ from tqdm import tqdm
 import config
 
 
-def load_and_pad(path, sr=config.SAMPLE_RATE, duration=config.CLIP_DURATION):
-    target_len = sr * duration
-    audio, _ = librosa.load(path, sr=sr, mono=True)
-
+def load_and_pad(path):
+    target_len = config.SAMPLE_RATE * config.CLIP_DURATION
+    audio, _ = librosa.load(path, sr=config.SAMPLE_RATE, mono=True)
     if len(audio) >= target_len:
         audio = audio[:target_len]
     else:
-        pad = target_len - len(audio)
-        audio = np.pad(audio, (0, pad), mode="constant")
-
+        audio = np.pad(audio, (0, target_len - len(audio)), mode="constant")
     return audio
 
 
-def compute_mel(audio, sr=config.SAMPLE_RATE):
+def compute_mel(audio):
     mel = librosa.feature.melspectrogram(
         y=audio,
-        sr=sr,
+        sr=config.SAMPLE_RATE,
         n_mels=config.N_MELS,
         n_fft=config.N_FFT,
         hop_length=config.HOP_LENGTH,
         fmax=config.F_MAX,
     )
     mel_db = librosa.power_to_db(mel, ref=np.max)
-
-    # normalize to [0, 1]
     mel_db = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-8)
     return mel_db.astype(np.float32)
 
 
-def process_dataset():
-    os.makedirs(config.PROCESSED_DATA_DIR, exist_ok=True)
+def process_stage(stage_name, class_list, raw_dir, processed_dir):
+    print(f"\n--- {stage_name} ---")
+    os.makedirs(processed_dir, exist_ok=True)
 
+    label_map = {cls: idx for idx, cls in enumerate(class_list)}
     records = []
-    label_map = {cls: idx for idx, cls in enumerate(config.CLASSES)}
 
-    for class_name in config.CLASSES:
-        class_dir = os.path.join(config.RAW_DATA_DIR, class_name)
+    for class_name in class_list:
+        class_dir = os.path.join(raw_dir, class_name)
         if not os.path.isdir(class_dir):
-            print(f"[WARNING] directory not found, skipping: {class_dir}")
+            print(f"  [WARNING] not found: {class_dir}")
             continue
 
         files = [
             f for f in os.listdir(class_dir)
             if f.lower().endswith((".wav", ".mp3", ".ogg", ".flac"))
         ]
-
-        print(f"Processing {class_name}: {len(files)} files")
+        print(f"  Processing {class_name}: {len(files)} files")
 
         for fname in tqdm(files, desc=class_name):
             src_path = os.path.join(class_dir, fname)
             try:
                 audio = load_and_pad(src_path)
-                mel = compute_mel(audio)
+                mel   = compute_mel(audio)
 
-                stem = os.path.splitext(fname)[0]
-                out_fname = f"{class_name}_{stem}.npy"
-                out_path = os.path.join(config.PROCESSED_DATA_DIR, out_fname)
+                stem     = os.path.splitext(fname)[0]
+                out_name = f"{class_name}_{stem}.npy"
+                out_path = os.path.join(processed_dir, out_name)
                 np.save(out_path, mel)
 
                 records.append({
-                    "npy_path": out_path,
-                    "label": label_map[class_name],
-                    "class_name": class_name,
+                    "npy_path":    out_path,
+                    "label":       label_map[class_name],
+                    "class_name":  class_name,
+                    "source_file": fname,
                 })
             except Exception as e:
-                print(f"[ERROR] {src_path}: {e}")
+                print(f"  [ERROR] {src_path}: {e}")
 
     manifest = pd.DataFrame(records)
-    manifest_path = os.path.join(config.PROCESSED_DATA_DIR, "manifest.csv")
+    manifest_path = os.path.join(processed_dir, "manifest.csv")
     manifest.to_csv(manifest_path, index=False)
-    print(f"\nDone. {len(manifest)} samples saved.")
-    print(f"Manifest: {manifest_path}")
-    print(manifest["class_name"].value_counts())
+    print(f"\n  {stage_name} done. {len(manifest)} samples.")
+    print(manifest["class_name"].value_counts().to_string())
+    return manifest_path
 
 
 if __name__ == "__main__":
-    process_dataset()
+    process_stage(
+        stage_name    = "Stage 1 (coarse)",
+        class_list    = config.STAGE1_CLASSES,
+        raw_dir       = "data/raw/stage1",
+        processed_dir = config.PROCESSED_STAGE1_DIR,
+    )
+    process_stage(
+        stage_name    = "Stage 2 (siren types)",
+        class_list    = config.STAGE2_CLASSES,
+        raw_dir       = "data/raw/stage2",
+        processed_dir = config.PROCESSED_STAGE2_DIR,
+    )

@@ -1,14 +1,13 @@
 """
 model.py
 
-3-block CNN for audio classification on mel spectrograms.
-Input shape: (batch, 1, N_MELS, time_frames)
-Output shape: (batch, NUM_CLASSES)
+Two CNN models sharing the same architecture but different output sizes:
+- AudioCNN(num_classes=3) for Stage 1 (gunshot / siren / background)
+- AudioCNN(num_classes=4) for Stage 2 (police / ambulance / firetruck / unknown)
 """
 
 import torch
 import torch.nn as nn
-
 import config
 
 
@@ -28,18 +27,14 @@ class ConvBlock(nn.Module):
 
 
 class AudioCNN(nn.Module):
-    def __init__(self, num_classes=config.NUM_CLASSES):
+    def __init__(self, num_classes):
         super().__init__()
-
         self.features = nn.Sequential(
-            ConvBlock(1, 32, dropout=0.25),
+            ConvBlock(1, 32,  dropout=0.25),
             ConvBlock(32, 64, dropout=0.25),
             ConvBlock(64, 128, dropout=0.25),
         )
-
-        # global average pooling collapses spatial dims regardless of input size
         self.gap = nn.AdaptiveAvgPool2d((1, 1))
-
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Linear(128, 256),
@@ -55,11 +50,24 @@ class AudioCNN(nn.Module):
         return x
 
 
+def get_stage1_model():
+    return AudioCNN(num_classes=config.NUM_STAGE1_CLASSES)
+
+
+def get_stage2_model():
+    return AudioCNN(num_classes=config.NUM_STAGE2_CLASSES)
+
+
 if __name__ == "__main__":
-    # quick sanity check
-    model = AudioCNN()
-    dummy = torch.zeros(8, 1, config.N_MELS, 173)  # 173 time frames for 4s at hop=512
-    out = model(dummy)
-    print(f"Output shape: {out.shape}")  # expect (8, NUM_CLASSES)
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable parameters: {total_params:,}")
+    dummy = torch.zeros(8, 1, config.N_MELS, 173)
+
+    m1 = get_stage1_model()
+    out1 = m1(dummy)
+    print(f"Stage 1 output: {out1.shape}")
+
+    m2 = get_stage2_model()
+    out2 = m2(dummy)
+    print(f"Stage 2 output: {out2.shape}")
+
+    params = sum(p.numel() for p in m1.parameters() if p.requires_grad)
+    print(f"Parameters per model: {params:,}")
