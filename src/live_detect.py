@@ -4,27 +4,28 @@ live_detect.py
 Real-time audio detection using the two-stage pipeline.
 Runs directly on your machine (outside Docker) since it needs microphone access.
 
-Install dependency first:
-    pip install sounddevice
+Setup:
+    1. Open WO Mic on your phone and press Start
+    2. Open WO Mic client on your PC and connect
+    3. Run: python src/live_detect.py --list-devices
+    4. Find "WO Mic Device" in the list and note its number
+    5. Run: python src/live_detect.py --device <number>
 
-Run:
-    python src/live_detect.py
-    python src/live_detect.py --threshold 0.85 --interval 0.5
-    python src/live_detect.py --list-devices
-    python src/live_detect.py --device 1
+Other options:
+    python src/live_detect.py                        (uses default mic)
+    python src/live_detect.py --threshold 0.90       (stricter alerts)
+    python src/live_detect.py --interval 0.5         (check every 0.5s)
 """
 
 import os
 import sys
 import argparse
-import threading
 import queue
 import datetime
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-# add src/ to path so config and model imports work
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
@@ -56,12 +57,41 @@ log_filename = os.path.join(
 )
 
 
-def log(message):
+def write_log(message):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {message}"
-    print(line)
     with open(log_filename, "a") as f:
         f.write(line + "\n")
+
+
+def print_alert(result, conf):
+    now = datetime.datetime.now().strftime("%I:%M:%S %p")
+
+    if "gunshot" in result:
+        label = "GUNSHOT"
+    elif "siren" in result:
+        siren_type = result.split("(")[-1].replace(")", "").strip().upper()
+        label = f"{siren_type} SIREN"
+    else:
+        label = result.upper()
+
+    line1 = f"  WARNING: {label} DETECTED at {now}"
+    line2 = f"  Confidence: {conf:.2%}"
+    width = max(len(line1), len(line2)) + 4
+
+    print("\n" + "!" * width)
+    print(line1)
+    print(line2)
+    print("!" * width + "\n")
+
+    write_log(f"WARNING: {label} DETECTED at {now} | confidence: {conf:.2%}")
+
+
+def print_clear():
+    now = datetime.datetime.now().strftime("%I:%M:%S %p")
+    msg = f"All clear at {now}"
+    print(f"  [{msg}]")
+    write_log(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +104,9 @@ def load_models(device):
         if not os.path.exists(path):
             raise FileNotFoundError(
                 f"Checkpoint not found: {path}\n"
-                "Make sure you run this from your project root directory."
+                "Make sure you run this from your project root:\n"
+                "  cd C:\\Users\\oana\\Documents\\Projects\\DL\n"
+                "  python src/live_detect.py"
             )
         model.load_state_dict(torch.load(path, map_location=device))
         model.eval()
@@ -91,13 +123,9 @@ def load_models(device):
 
 def buffer_to_mel(audio_buffer):
     target_len = config.SAMPLE_RATE * config.CLIP_DURATION
-
-    if len(audio_buffer) >= target_len:
-        audio = audio_buffer[-target_len:]
-    else:
-        audio = np.pad(audio_buffer, (0, target_len - len(audio_buffer)), mode="constant")
-
-    audio = audio.astype(np.float32)
+    audio = audio_buffer[-target_len:].astype(np.float32)
+    if len(audio) < target_len:
+        audio = np.pad(audio, (0, target_len - len(audio)), mode="constant")
 
     mel = librosa.feature.melspectrogram(
         y=audio,
@@ -112,46 +140,51 @@ def buffer_to_mel(audio_buffer):
     return torch.tensor(mel_db, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
 
 
-def run_inference(mel, stage1, stage2, device, confidence_threshold):
+def run_inference(mel, stage1, stage2, device):
     mel = mel.to(device)
-
     with torch.no_grad():
-        s1_logits = stage1(mel)
-        s1_probs  = F.softmax(s1_logits, dim=1)[0]
-        s1_pred   = s1_probs.argmax().item()
-        s1_class  = config.STAGE1_CLASSES[s1_pred]
-        s1_conf   = s1_probs[s1_pred].item()
+        s1_probs = F.softmax(stage1(mel), dim=1)[0]
+        s1_pred  = s1_probs.argmax().item()
+        s1_class = config.STAGE1_CLASSES[s1_pred]
+        s1_conf  = s1_probs[s1_pred].item()
 
         if s1_class == "siren":
-            s2_logits = stage2(mel)
-            s2_probs  = F.softmax(s2_logits, dim=1)[0]
-            s2_pred   = s2_probs.argmax().item()
-            s2_conf   = s2_probs[s2_pred].item()
-            s2_class  = (
+            s2_probs = F.softmax(stage2(mel), dim=1)[0]
+            s2_pred  = s2_probs.argmax().item()
+            s2_conf  = s2_probs[s2_pred].item()
+            s2_class = (
                 config.STAGE2_CLASSES[s2_pred]
                 if s2_conf >= config.STAGE2_CONFIDENCE_THRESHOLD
                 else "unknown"
             )
             return f"siren ({s2_class})", s2_conf
-        else:
-            return s1_class, s1_conf
+
+        return s1_class, s1_conf
 
 
 # ---------------------------------------------------------------------------
 # MAIN LOOP
 # ---------------------------------------------------------------------------
 
-def run(device_id=None, confidence_threshold=0.85, interval=0.5):
+def run(device_id, confidence_threshold, interval):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log(f"Loading models on {device}")
-    stage1, stage2 = load_models(device)
-    log("Models loaded. Listening...")
-    log(f"Confidence threshold : {confidence_threshold:.0%}")
-    log(f"Inference interval   : {interval}s")
-    log(f"Log file             : {log_filename}")
-    log("-" * 50)
 
-    buffer_size = config.SAMPLE_RATE * config.CLIP_DURATION
+    print("Loading models...")
+    stage1, stage2 = load_models(device)
+
+    print("\n" + "=" * 50)
+    print("  GUNSHOT & SIREN DETECTION SYSTEM")
+    print("=" * 50)
+    print(f"  Mic device       : {'default' if device_id is None else device_id}")
+    print(f"  Confidence limit : {confidence_threshold:.0%}")
+    print(f"  Check every      : {interval}s")
+    print(f"  Log file         : {log_filename}")
+    print("=" * 50)
+    print("\nListening... Press Ctrl+C to stop.\n")
+
+    write_log("Session started")
+
+    buffer_size  = config.SAMPLE_RATE * config.CLIP_DURATION
     audio_buffer = np.zeros(buffer_size, dtype=np.float32)
     audio_queue  = queue.Queue()
 
@@ -168,37 +201,36 @@ def run(device_id=None, confidence_threshold=0.85, interval=0.5):
     if device_id is not None:
         stream_kwargs["device"] = device_id
 
-    last_result = None
+    last_result = "background"
 
-    with sd.InputStream(**stream_kwargs):
-        print("\nPress Ctrl+C to stop.\n")
-        while True:
-            try:
-                chunk = audio_queue.get(timeout=2.0)
-            except queue.Empty:
-                continue
+    try:
+        with sd.InputStream(**stream_kwargs):
+            while True:
+                try:
+                    chunk = audio_queue.get(timeout=2.0)
+                except queue.Empty:
+                    continue
 
-            # roll buffer and append new chunk
-            chunk_len = len(chunk)
-            audio_buffer = np.roll(audio_buffer, -chunk_len)
-            audio_buffer[-chunk_len:] = chunk
+                chunk_len = len(chunk)
+                audio_buffer = np.roll(audio_buffer, -chunk_len)
+                audio_buffer[-chunk_len:] = chunk
 
-            mel    = buffer_to_mel(audio_buffer)
-            result, conf = run_inference(mel, stage1, stage2, device, confidence_threshold)
+                result, conf = run_inference(
+                    buffer_to_mel(audio_buffer), stage1, stage2, device
+                )
 
-            # only log when result changes or is a non-background detection
-            if result != "background":
-                if result != last_result:
-                    log(f"DETECTED: {result.upper():<25} confidence: {conf:.2%}")
-                    last_result = result
-            else:
-                if last_result is not None and last_result != "background":
-                    log("back to background")
-                last_result = "background"
+                if result != "background" and conf >= confidence_threshold:
+                    if result != last_result:
+                        print_alert(result, conf)
+                        last_result = result
+                else:
+                    if last_result != "background":
+                        print_clear()
+                        last_result = "background"
 
-            except KeyboardInterrupt:
-                log("Stopped by user.")
-                break
+    except KeyboardInterrupt:
+        write_log("Session ended by user")
+        print("\nStopped. Log saved to:", log_filename)
 
 
 # ---------------------------------------------------------------------------
@@ -207,17 +239,18 @@ def run(device_id=None, confidence_threshold=0.85, interval=0.5):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--device",       type=int,   default=None,
+                        help="Mic device index (use --list-devices to find it)")
     parser.add_argument("--threshold",    type=float, default=0.85,
-                        help="Minimum confidence to log a detection (default: 0.85)")
+                        help="Minimum confidence to trigger an alert (default: 0.85)")
     parser.add_argument("--interval",     type=float, default=0.5,
                         help="Seconds between inference runs (default: 0.5)")
-    parser.add_argument("--device",       type=int,   default=None,
-                        help="Microphone device index (see --list-devices)")
     parser.add_argument("--list-devices", action="store_true",
-                        help="Print available audio devices and exit")
+                        help="Print available audio input devices and exit")
     args = parser.parse_args()
 
     if args.list_devices:
+        print("\nAvailable audio devices:")
         print(sd.query_devices())
         sys.exit(0)
 
